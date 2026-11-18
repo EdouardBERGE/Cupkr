@@ -30,7 +30,6 @@ public:
         invert_bit_encoding = config.invert_bit_encoding;
         simplified_prob_update = config.simplified_prob_update;
     }
-    ContextState(const ContextState& o) = default;
     struct Ctx {
         ContextState* st;
         size_t idx;
@@ -71,16 +70,22 @@ public:
     MatchFinder(const std::vector<uint8_t>& data) {
         size_t n = data.size();
         suffixes.assign(n, 0);
-        std::vector<size_t> idx(n);
-        for (size_t i=0;i<n;i++) idx[i]=i;
-        std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b){
-            size_t i=a, j=b;
-            while (i<n && j<n && data[i]==data[j]) { i++; j++; }
-            if (i==n && j==n) return a < b;
-            if (i==n) return true;
-            if (j==n) return false;
-            return data[i] < data[j];
-        });
+        // tri des suffixes par doublement de prefixe (O(n log^2 n)) ; l'ordre des
+        // suffixes etant unique, le resultat est identique a divsufsort (Rust).
+        std::vector<size_t> idx(n), rank(n), tmp(n);
+        for (size_t i=0;i<n;i++) { idx[i]=i; rank[i]=data[i]; }
+        for (size_t k=1; n>1; k<<=1) {
+            auto key2=[&](size_t a){ return a+k<n ? (long long)rank[a+k] : -1LL; };
+            auto cmp=[&](size_t a, size_t b){
+                if (rank[a]!=rank[b]) return rank[a]<rank[b];
+                return key2(a)<key2(b);
+            };
+            std::sort(idx.begin(), idx.end(), cmp);
+            tmp[idx[0]]=0;
+            for (size_t i=1;i<n;i++) tmp[idx[i]]=tmp[idx[i-1]]+(cmp(idx[i-1],idx[i])?1:0);
+            rank.swap(tmp);
+            if (rank[idx[n-1]]==n-1) break;
+        }
         for (size_t i=0;i<n;i++) suffixes[i] = (int32_t)idx[i];
         rev_suffixes.assign(n,0);
         for (size_t si=0; si<n; si++) rev_suffixes[suffixes[si]] = (uint32_t)si;
@@ -240,17 +245,19 @@ public:
 class CostCounter : public EntropyCoder {
 public:
     double cost=0;
-    std::vector<double> log2_table;
+    const double* log2_table;
     bool invert;
-    CostCounter(const Config& c) {
-        invert = c.invert_bit_encoding;
-        log2_table.resize(ONE_PROB);
-        for (uint32_t prob=0; prob<ONE_PROB; prob++) {
-            if (prob==0) { log2_table[prob]=0; continue; }
-            double inv = (double)ONE_PROB / (double)prob;
-            log2_table[prob] = std::log2(inv);
-        }
+    // table log2 calculee une seule fois (avant : 256 log2 + 1 allocation a chaque construction)
+    static const double* table() {
+        static const std::vector<double> t = []{
+            std::vector<double> v(ONE_PROB);
+            for (uint32_t prob=0; prob<ONE_PROB; prob++)
+                v[prob] = prob==0 ? 0 : std::log2((double)ONE_PROB / (double)prob);
+            return v;
+        }();
+        return t.data();
     }
+    CostCounter(const Config& c) : log2_table(table()) { invert = c.invert_bit_encoding; }
     void reset(){cost=0;}
     double costv() const { return cost; }
     void encode_bit(bool bit, uint16_t prob) override {
@@ -266,7 +273,6 @@ struct CoderState {
     size_t pos=0;
     size_t parity_contexts=1;
     CoderState(const Config& c): contexts((1+255)*c.parity_contexts + 1 + 64 + 64, c), parity_contexts(c.parity_contexts) {}
-    CoderState(const CoderState& o) = default;
 };
 
 // helpers encode
@@ -588,7 +594,11 @@ struct Arrival { std::shared_ptr<ParseNode> parse; CoderState state; double cost
 
 std::vector<uint8_t> parsing_pack(const std::vector<uint8_t>& data, uint8_t level, const Config& config, ProgressCallback cb) {
     ParseConfig pcfg = ParseConfig::from_level(level);
-    MatchFinder base_mf(data);
+    MatchFinder mf(data);
+    mf.max_queue_size = pcfg.max_queue_size;
+    mf.max_matches_per_length = pcfg.max_matches_per_length;
+    mf.patience = pcfg.patience;
+    mf.max_length_diff = pcfg.max_length_diff;
     // We'll set fields when using
     std::vector<int> near_matches(1024, -1);
     std::vector<int> last_seen(256, -1);
@@ -602,23 +612,23 @@ std::vector<uint8_t> parsing_pack(const std::vector<uint8_t>& data, uint8_t leve
         std::vector<Arrival> out;
         for (auto& arr : vec) {
             if (seen.insert(arr.state.last_offset).second) {
-                if (out.size() < max_arrivals) out.push_back(arr);
-            } else remaining.push_back(arr);
+                if (out.size() < max_arrivals) out.push_back(std::move(arr));
+            } else remaining.push_back(std::move(arr));
         }
         for (auto& arr : remaining) {
             if (out.size() >= max_arrivals) break;
-            out.push_back(arr);
+            out.push_back(std::move(arr));
         }
         vec = std::move(out);
     };
     auto add_arrival = [&](size_t pos, Arrival arr) {
         auto& vec = arrivals[pos];
         if (max_arrivals==0) {
-            if (vec.empty()) vec.push_back(arr);
-            else if (vec[0].cost > arr.cost) vec[0]=arr;
+            if (vec.empty()) vec.push_back(std::move(arr));
+            else if (vec[0].cost > arr.cost) vec[0]=std::move(arr);
             return;
         }
-        vec.push_back(arr);
+        vec.push_back(std::move(arr));
         if (vec.size() > max_arrivals*2) {
             sort_arrivals(vec);
         }
@@ -633,17 +643,13 @@ std::vector<uint8_t> parsing_pack(const std::vector<uint8_t>& data, uint8_t leve
     auto add_match = [&](std::unordered_map<size_t,std::vector<Arrival>>& arrivals, size_t pos, size_t offset, size_t length, const Arrival& arrival) {
         if (length < config.min_length()) return;
         length = std::min(length, (size_t)config.max_length);
-        CostCounter cc(config); // reset cost
-        CoderState st = arrival.state;
         Op op; op.type=Op::Match; op.offset=(uint32_t)offset; op.len=(uint32_t)length;
-        // encode to cost counter
-        CostCounter ccc = CostCounter(config);
-        // Need encode with cost counter; encode_op template? encode_op takes EntropyCoder&; CostCounter derives.
+        cost_counter.reset();
         CoderState st2 = arrival.state;
-        encode_op(ccc, st2, config, op);
-        Arrival na{std::make_shared<ParseNode>(), st2, arrival.cost+ccc.costv()};
+        encode_op(cost_counter, st2, config, op);
+        Arrival na{std::make_shared<ParseNode>(), std::move(st2), arrival.cost+cost_counter.costv()};
         na.parse->prev=arrival.parse; na.parse->op=op;
-        add_arrival(pos+length, na);
+        add_arrival(pos+length, std::move(na));
     };
     std::unordered_map<uint32_t, double> best_per_offset;
     for (size_t pos=0; pos<data.size(); pos++) {
@@ -655,7 +661,7 @@ std::vector<uint8_t> parsing_pack(const std::vector<uint8_t>& data, uint8_t leve
         };
         auto it_arr = arrivals.find(pos);
         if (it_arr == arrivals.end()) continue;
-        auto here = it_arr->second;
+        auto here = std::move(it_arr->second);
         arrivals.erase(it_arr);
         sort_arrivals(here);
         best_per_offset.clear();
@@ -665,13 +671,6 @@ std::vector<uint8_t> parsing_pack(const std::vector<uint8_t>& data, uint8_t leve
             auto itbo = best_per_offset.find(a.state.last_offset);
             if (itbo==best_per_offset.end()) best_per_offset[a.state.last_offset]=a.cost; else itbo->second=std::min(itbo->second,a.cost);
         }
-        // match finder for this pos
-        MatchFinder mf = base_mf;
-        mf.max_queue_size = pcfg.max_queue_size;
-        mf.max_matches_per_length = pcfg.max_matches_per_length;
-        mf.patience = pcfg.patience;
-        mf.max_length_diff = pcfg.max_length_diff;
-        // base copy suffix arrays
     for (auto& arrival : here) {
             if (arrival.cost > std::min(best_cost + pcfg.max_cost_delta, best_per_offset[arrival.state.last_offset] + pcfg.max_offset_cost_delta)) continue;
             bool found_last_offset=false;
@@ -688,12 +687,16 @@ std::vector<uint8_t> parsing_pack(const std::vector<uint8_t>& data, uint8_t leve
                     add_match(arrivals, pos, offset, m->length, arrival);
                     if ((size_t)m->length >= pcfg.greedy_size) break;
                 }
-                if ((size_t)m->length >= pcfg.greedy_size) {
-                    // break arrival loop
-                    goto after_matches;
-                }
+                if ((size_t)m->length >= pcfg.greedy_size) goto after_matches;
             }
             after_matches:
+            // DIFFERENCE VOULUE avec upkr Rust : sur un match >= greedy_size, Rust fait
+            // `break 'arrival_loop` (abandonne near matches, last offset, litteral ET les
+            // arrivals restantes de cette position). Ici on ne quitte que la boucle des
+            // matches : exploration plus large -> fichiers parfois plus petits
+            // (eboulement30f.bin : 792 vs 808 octets), format identique (le decruncher
+            // Rust et unpack.asm Z80 decompressent a l'identique), un peu plus lent.
+            // Ne pas "corriger".
             // near matches
             size_t near_left = pcfg.num_near_matches;
             int match_pos = (last_seen[(uint8_t)data[pos]]); // -1 if none
@@ -712,13 +715,13 @@ std::vector<uint8_t> parsing_pack(const std::vector<uint8_t>& data, uint8_t leve
                 size_t length = match_length(offset);
                 if (length > 0) add_match(arrivals, pos, offset, length, arrival);
             }
-            CostCounter cc(config);
-            CoderState st = arrival.state;
+            cost_counter.reset();
+            CoderState st = std::move(arrival.state);
             Op op; op.type=Op::Literal; op.lit=data[pos];
-            encode_op(cc, st, config, op);
-            Arrival na{std::make_shared<ParseNode>(), st, arrival.cost+cc.costv()};
-            na.parse->prev=arrival.parse; na.parse->op=op;
-            add_arrival(pos+1, na);
+            encode_op(cost_counter, st, config, op);
+            Arrival na{std::make_shared<ParseNode>(), std::move(st), arrival.cost+cost_counter.costv()};
+            na.parse->prev=std::move(arrival.parse); na.parse->op=op;
+            add_arrival(pos+1, std::move(na));
         }
         near_matches[pos % near_matches.size()] = last_seen[(uint8_t)data[pos]];
         last_seen[(uint8_t)data[pos]] = (int)pos;
